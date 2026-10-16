@@ -1,15 +1,19 @@
 --==================================================================
---  Mu Delta Lite | Blox Fruits keyless auto-farm
+--  Mu Delta Lite v2 | Blox Fruits keyless auto-farm
 --  Rebuilt for Delta + low-end phones. No key, no UI library.
 --  Paste into Delta, join Blox Fruits, execute.
+--
+--  v2 changes: task.wait precedence fix, multi-source quest-state check,
+--  viewport-based combat input, generation guard against duplicate loops,
+--  live diagnostics panel, fruit panel, real weapon list refresh.
 --==================================================================
 
-local Players  = game:GetService("Players")
-local RS       = game:GetService("ReplicatedStorage")
-local WS       = game:GetService("Workspace")
-local VU       = game:GetService("VirtualUser")
-local TS       = game:GetService("TweenService")
-local Lighting = game:GetService("Lighting")
+local Players    = game:GetService("Players")
+local RS         = game:GetService("ReplicatedStorage")
+local WS         = game:GetService("Workspace")
+local VU         = game:GetService("VirtualUser")
+local TS         = game:GetService("TweenService")
+local Lighting   = game:GetService("Lighting")
 local StarterGui = game:GetService("StarterGui")
 
 local LP = Players.LocalPlayer
@@ -27,11 +31,16 @@ if not SEA then
 	return
 end
 
-if getgenv().MuDeltaLite then
-	local old = LP.PlayerGui:FindFirstChild("MuDeltaLite")
+--==================== generation guard ====================
+-- re-executing this script must kill the OLD loops, not just the old GUI
+local GEN = (getgenv().MuDeltaLiteGen or 0) + 1
+getgenv().MuDeltaLiteGen = GEN
+local function stale() return getgenv().MuDeltaLiteGen ~= GEN end
+
+do
+	local old = LP:FindFirstChild("PlayerGui") and LP.PlayerGui:FindFirstChild("MuDeltaLite")
 	if old then old:Destroy() end
 end
-getgenv().MuDeltaLite = true
 
 --==================== config ====================
 local C = {
@@ -48,7 +57,64 @@ local C = {
 	Stats       = {},
 	TweenSpeed  = 300,
 	Range       = 4000,
+	-- fruit panel
+	FruitNotify = false,
+	AutoCollect = false,
+	AutoStore   = false,
+	FruitSniper = false,
+	-- diagnostics
+	Verbose     = true,
 }
+
+--==================== diagnostics ====================
+local D = {
+	lastErr     = "-",
+	lastFeature = "-",
+	counts      = {},
+	seen        = {},
+	loopTicks   = 0,
+	quests      = 0,
+	npcs        = 0,
+	questSource = "none",
+	mobsTotal   = 0,
+	mobsAlive   = 0,
+	enemyFolder = "unknown",
+	feat        = {},
+}
+
+local function report(feature, err)
+	err = tostring(err)
+	D.counts[feature] = (D.counts[feature] or 0) + 1
+	D.lastFeature = feature
+	D.lastErr = feature .. " :: " .. err
+	if D.seen[feature] ~= err then
+		D.seen[feature] = err
+		if C.Verbose then
+			warn("[Mu Delta Lite] " .. feature .. " -> " .. err .. " (x" .. D.counts[feature] .. ")")
+		end
+	end
+end
+
+-- run a function, report failures, never swallow silently
+local function run(feature, fn, ...)
+	local ok, err = pcall(fn, ...)
+	if not ok then report(feature, err) end
+	return ok, err
+end
+
+local function has(fnName)
+	if D.feat[fnName] == nil then
+		D.feat[fnName] = type(getfenv and rawget(getfenv(), fnName) or nil) == "function"
+		if D.feat[fnName] == nil then D.feat[fnName] = false end
+	end
+	return D.feat[fnName]
+end
+
+local function tcount(t)
+	local n = 0
+	for _ in pairs(t) do n = n + 1 end
+	return n
+end
 
 --==================== helpers ====================
 local function hrp()
@@ -69,23 +135,30 @@ end
 
 local Remotes = RS:WaitForChild("Remotes", 30)
 local CommF = Remotes and Remotes:WaitForChild("CommF_", 30)
+if not CommF then report("boot", "ReplicatedStorage.Remotes.CommF_ not found after 30s") end
 
 local function fire(...)
 	if not CommF then return end
 	local a = {...}
-	pcall(function() CommF:InvokeServer(unpack(a)) end)
+	-- NOTE: InvokeServer returns nil on server rejection; it does not throw.
+	-- pcall can only catch Lua-side exceptions. Server refusal is invisible here.
+	local ok, err = pcall(function() CommF:InvokeServer(unpack(a)) end)
+	if not ok then report("remote:" .. tostring(a[1]), err) end
 end
 
+-- multi-source: Blox Fruits has moved this frame around between updates
 local function isQuestOn()
-	local ok, res = pcall(function()
-		local main = LP.PlayerGui:FindFirstChild("Main")
-		local q = main and main:FindFirstChild("Quest")
-		return q and q.Visible
-	end)
-	return ok and res == true
+	local pg = LP:FindFirstChild("PlayerGui")
+	if not pg then return false end
+	local main = pg:FindFirstChild("Main")
+	local q = main and main:FindFirstChild("Quest")
+	if q and q.Visible then return true end
+	local tq = pg:FindFirstChild("TrackedQuestFrame")
+	local f = tq and tq:FindFirstChild("Frame")
+	if f and f.Visible then return true end
+	return false
 end
 
--- tween with a single tracked target so loops don't fight each other
 local activeTween, activeTarget
 local function goTo(cf)
 	local r = hrp()
@@ -108,8 +181,17 @@ local function hardTp(cf)
 	r.CFrame = cf
 end
 
+-- device-agnostic click point (was hardcoded 1280x672 = desktop)
+local function clickPoint()
+	local cam = WS.CurrentCamera
+	local vp = cam and cam.ViewportSize
+	if vp and vp.X > 0 and vp.Y > 0 then
+		return Vector2.new(vp.X / 2, vp.Y / 2)
+	end
+	return Vector2.new(1280, 672)
+end
+
 --==================== quest data ====================
--- read straight from the game so it never goes stale
 local questMap = {}
 
 local FB = {
@@ -156,41 +238,88 @@ local function addQuest(lv, q, n, enemy)
 end
 
 local function indexQuests()
-	local ok, Q = pcall(function() return require(RS.Quests) end)
-	if ok and type(Q) == "table" then
-		for name, nums in pairs(Q) do
-			if name ~= "CitizenQuest" and type(nums) == "table" then
-				for n, info in pairs(nums) do
-					if type(info) == "table" and tonumber(info.LevelReq) and type(info.Task) == "table" then
-						local enemy = next(info.Task)
-						if enemy then addQuest(info.LevelReq, name, n, enemy) end
+	local module = RS:FindFirstChild("Quests")
+	if not module then
+		report("indexQuests", "ReplicatedStorage.Quests missing -> fallback table only")
+	else
+		local ok, Q = pcall(require, module)
+		if not ok then
+			report("indexQuests", "require(Quests) threw: " .. tostring(Q))
+		elseif type(Q) ~= "table" then
+			report("indexQuests", "Quests returned " .. type(Q) .. ", expected table")
+		else
+			local found = 0
+			for name, nums in pairs(Q) do
+				if name ~= "CitizenQuest" and type(nums) == "table" then
+					for n, info in pairs(nums) do
+						if type(info) == "table" and tonumber(info.LevelReq) and type(info.Task) == "table" then
+							local enemy = next(info.Task)
+							if enemy then addQuest(info.LevelReq, name, n, enemy); found = found + 1 end
+						end
 					end
 				end
 			end
+			if found > 0 then D.questSource = "game module" end
+			report("indexQuests", "module indexed " .. found .. " quests (informational)")
 		end
 	end
+
+	local fromFallback = 0
 	for _, e in ipairs(FB) do
-		if not questMap[e[1]] then addQuest(e[1], e[2], e[3], e[4]) end
+		if not questMap[e[1]] then addQuest(e[1], e[2], e[3], e[4]); fromFallback = fromFallback + 1 end
+	end
+	if D.questSource == "none" then D.questSource = "fallback table" end
+
+	D.quests = tcount(questMap)
+	if D.quests == 0 then
+		report("indexQuests", "ZERO quests indexed - auto farm level cannot work")
 	end
 end
 
 local npcMap = {}
 local function indexNpcs()
-	local ok, G = pcall(function() return require(RS.GuideModule) end)
-	if not ok or type(G) ~= "table" then return end
+	local module = RS:FindFirstChild("GuideModule")
+	if not module then
+		report("indexNpcs", "ReplicatedStorage.GuideModule missing -> no NPC navigation")
+		return
+	end
+	local ok, G = pcall(require, module)
+	if not ok then
+		report("indexNpcs", "require(GuideModule) threw: " .. tostring(G))
+		return
+	end
+	if type(G) ~= "table" then
+		report("indexNpcs", "GuideModule returned " .. type(G) .. ", expected table")
+		return
+	end
 	local data = G.Data or G
 	local list = data.NPCList
-	if type(list) ~= "table" then return end
+	if type(list) ~= "table" then
+		report("indexNpcs", "GuideModule.Data.NPCList missing or not a table")
+		return
+	end
 	for npc, info in pairs(list) do
-		if typeof(npc) == "Instance" and type(info) == "table" and info.Levels then
+		if typeof(npc) == "Instance" and type(info) == "table" and type(info.Levels) == "table" then
 			local ok2, cf = pcall(function() return npc.CFrame end)
-			if ok2 and cf then
+			if ok2 and typeof(cf) == "CFrame" then
 				for _, lv in ipairs(info.Levels) do
 					if type(lv) == "number" and not npcMap[lv] then npcMap[lv] = cf end
 				end
 			end
 		end
 	end
+	D.npcs = tcount(npcMap)
+	report("indexNpcs", "indexed " .. D.npcs .. " NPC anchor levels (informational)")
+end
+
+-- FIX: npcMap is keyed by NPC level; the old code looked it up with the QUEST level.
+-- Use the highest NPC anchor <= player level instead of an exact match.
+local function npcFor(lv)
+	local bestLv, best = -1, nil
+	for k, cf in pairs(npcMap) do
+		if k <= lv and k > bestLv then bestLv, best = k, cf end
+	end
+	return best
 end
 
 local function questFor(lv)
@@ -202,8 +331,12 @@ local function questFor(lv)
 end
 
 --==================== enemies ====================
+local function enemyFolder()
+	return WS:FindFirstChild("Enemies")
+end
+
 local function findEnemy(full, base, tag)
-	local folder = WS:FindFirstChild("Enemies")
+	local folder = enemyFolder()
 	local r = hrp()
 	if not folder or not r then return nil end
 	local ex, exD, lo, loD
@@ -215,7 +348,7 @@ local function findEnemy(full, base, tag)
 				local d = (p.Position - r.Position).Magnitude
 				if v.Name == full then
 					if not exD or d < exD then ex, exD = v, d end
-				elseif v.Name:find(base, 1, true) and (not tag or v.Name:find(tag, 1, true)) then
+				elseif base and v.Name:find(base, 1, true) and (not tag or v.Name:find(tag, 1, true)) then
 					if not loD or d < loD then lo, loD = v, d end
 				end
 			end
@@ -225,7 +358,7 @@ local function findEnemy(full, base, tag)
 end
 
 local function findNearest(range)
-	local folder = WS:FindFirstChild("Enemies")
+	local folder = enemyFolder()
 	local r = hrp()
 	if not folder or not r then return nil end
 	local best, bestD
@@ -243,26 +376,30 @@ local function findNearest(range)
 end
 
 local function bringMob(full, base, tag)
-	local folder = WS:FindFirstChild("Enemies")
+	local folder = enemyFolder()
 	local r = hrp()
 	if not folder or not r then return end
-	pcall(function()
-		sethiddenproperty(LP, "SimulationRadius", math.huge)
-		sethiddenproperty(LP, "MaxSimulationRadius", math.huge)
-	end)
+	if has("sethiddenproperty") then
+		pcall(function()
+			sethiddenproperty(LP, "SimulationRadius", math.huge)
+			sethiddenproperty(LP, "MaxSimulationRadius", math.huge)
+		end)
+	end
 	local pos = r.Position
-	local n = 0
+	local n, slot = 0, 0
 	for _, v in pairs(folder:GetChildren()) do
 		if n >= 6 then break end
-		if v.Name == full or (v.Name:find(base, 1, true) and (not tag or v.Name:find(tag, 1, true))) then
+		if v.Name == full or (base and v.Name:find(base, 1, true) and (not tag or v.Name:find(tag, 1, true))) then
 			local h = v:FindFirstChildOfClass("Humanoid")
 			local p = v:FindFirstChild("HumanoidRootPart")
 			if h and h.Health > 0 and p and (p.Position - pos).Magnitude < 400 then
+				local off = Vector3.new(slot * 6, 3, 0)
+				slot = slot + 1
 				pcall(function()
 					p.CanCollide = false
 					p.Size = Vector3.new(30, 30, 30)
 					h.PlatformStand = true
-					p.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
+					p.CFrame = CFrame.new(pos + off)
 				end)
 				n = n + 1
 			end
@@ -272,22 +409,26 @@ end
 
 --==================== combat ====================
 local CF
-pcall(function() CF = require(LP.PlayerScripts:WaitForChild("CombatFramework", 10)) end)
+local cfOk, cfErr = pcall(function() CF = require(LP.PlayerScripts:WaitForChild("CombatFramework", 10)) end)
+if not cfOk then report("combat", "CombatFramework require failed: " .. tostring(cfErr)) end
 
 local function equipWeapon()
 	if not alive() then return end
 	local c = LP.Character
-	local h = c:FindFirstChildOfClass("Humanoid")
+	local h = c and c:FindFirstChildOfClass("Humanoid")
 	if not h then return end
 	local name = C.Weapon
-	if name then
-		local t = LP.Backpack:FindFirstChild(name)
-		if t and t:IsA("Tool") then h:EquipTool(t) end
+	-- FIX: "(none)" is a truthy placeholder; treat it as "no preference"
+	if name and name ~= "(none)" then
+		local t = LP.Backpack:FindFirstChild(name) or c:FindFirstChild(name)
+		if t and t:IsA("Tool") and c:FindFirstChild(t.Name) == nil then
+			h:EquipTool(t)
+		end
 		return
 	end
 	if c:FindFirstChildOfClass("Tool") then return end
 	for _, t in pairs(LP.Backpack:GetChildren()) do
-		if t:IsA("Tool") then h:EquipTool(t) break end
+		if t:IsA("Tool") then h:EquipTool(t); break end
 	end
 end
 
@@ -306,12 +447,84 @@ local function attack()
 				ac.hitboxMagnitude = 120
 			end
 		end)
-		if not ok then CF = nil end
+		if not ok then
+			report("combat", "activeController fields rejected -> disabling fast attack")
+			CF = nil
+		end
 	end
 	pcall(function()
 		VU:CaptureController()
-		VU:Button1Down(Vector2.new(1280, 672))
+		VU:Button1Down(clickPoint())
 	end)
+end
+
+--==================== fruits ====================
+local fruitSeen = {}
+local snipeList, snipeIdx = {}, 1
+local lastSnipe, lastStore = 0, 0
+
+local function isFruit(inst)
+	return inst:IsA("Tool") and inst.Name:find("Fruit") ~= nil and inst:FindFirstChild("Handle") ~= nil
+end
+
+local function notify(title, text)
+	pcall(function()
+		StarterGui:SetCore("SendNotification", {Title = title, Text = text, Duration = 6})
+	end)
+end
+
+local function seedFruits()
+	fruitSeen = {}
+	for _, v in pairs(WS:GetChildren()) do
+		if isFruit(v) then fruitSeen[v] = true end
+	end
+end
+
+local function findGroundFruit(range)
+	local r = hrp()
+	if not r then return nil end
+	local best, bestD
+	for _, v in pairs(WS:GetChildren()) do
+		if isFruit(v) then
+			local d = (v.Handle.Position - r.Position).Magnitude
+			if d <= range and (not bestD or d < bestD) then best, bestD = v, d end
+		end
+	end
+	return best
+end
+
+local function heldFruit()
+	local c = LP.Character
+	if c then
+		for _, t in pairs(c:GetChildren()) do
+			if isFruit(t) then return t end
+		end
+	end
+	local b = LP.Backpack
+	if b then
+		for _, t in pairs(b:GetChildren()) do
+			if isFruit(t) then return t end
+		end
+	end
+	return nil
+end
+
+local function loadSnipeList()
+	local ok, res = pcall(function() return CommF:InvokeServer("GetFruits") end)
+	if ok and type(res) == "table" and #res > 0 then
+		snipeList = {}
+		for _, f in ipairs(res) do
+			if type(f) == "table" and f.Name then table.insert(snipeList, f.Name) end
+		end
+		if #snipeList == 0 then
+			report("fruit", "GetFruits returned a table with no .Name fields")
+		end
+	else
+		snipeList = {"Dough Fruit","Dragon Fruit","Leopard Fruit","Kitsune Fruit","Venom Fruit",
+			"Shadow Fruit","Control Fruit","Spirit Fruit","Mammoth Fruit","T-Rex Fruit",
+			"Gas Fruit","Yeti Fruit","Blizzard Fruit","Gravity Fruit","Portal Fruit"}
+		report("fruit", "GetFruits unavailable -> using hardcoded snipe list")
+	end
 end
 
 --==================== main loop ====================
@@ -337,8 +550,12 @@ local function farmStep()
 
 	if not C.FarmLevel then return end
 
-	local q, qLv = questFor(level())
-	if not q then return end
+	local lv = level()
+	local q, qLv = questFor(lv)
+	if not q then
+		report("farm", "no quest entry for level " .. tostring(lv))
+		return
+	end
 
 	if isQuestOn() then
 		local t = findEnemy(q.enemy, q.base, q.tag)
@@ -354,7 +571,7 @@ local function farmStep()
 				attack()
 			end
 		else
-			local cf = qLv and npcMap[qLv]
+			local cf = npcFor(lv)
 			if cf then goTo(cf) end
 		end
 	elseif C.AutoQuest then
@@ -362,368 +579,45 @@ local function farmStep()
 		if now - lastQuestFire > 0.6 then
 			lastQuestFire = now
 			fire("StartQuest", q.quest, q.num)
-			local cf = qLv and npcMap[qLv]
+			local cf = npcFor(lv)
 			if cf and (cf.Position - r.Position).Magnitude > 45 then goTo(cf) end
 		end
 	end
 end
 
+local function fruitStep()
+	local now = os.clock()
+
+	if C.FruitSniper and now - lastSnipe > 0.5 and #snipeList > 0 then
+		lastSnipe = now
+		local name = snipeList[snipeIdx]
+		snipeIdx = snipeIdx % #snipeList + 1
+		if name then fire("PurchaseRawFruit", name, false) end
+	end
+
+	if C.AutoCollect then
+		local f = findGroundFruit(4000)
+		if f then goTo(f.Handle.CFrame) end
+	end
+
+	if C.AutoStore and now - lastStore > 1 then
+		lastStore = now
+		local t = heldFruit()
+		if t and t.Parent == LP.Character then
+			fire("StoreFruit", (t.Name:gsub(" Fruit$", "")), t)
+		end
+	end
+end
+
 task.spawn(function()
-	while true do
-		pcall(farmStep)
+	while not stale() do
+		D.loopTicks = D.loopTicks + 1
+
+		run("farmStep", farmStep)
+		run("fruitStep", fruitStep)
 
 		local now = os.clock()
 
 		if C.AutoHaki and now - lastHaki > 0.5 then
 			lastHaki = now
-			local c = LP.Character
-			if c and not c:FindFirstChild("HasBuso") then fire("Buso") end
-		end
-
-		if now - lastStats > 0.7 then
-			lastStats = now
-			local d = LP:FindFirstChild("Data")
-			local pts = d and d:FindFirstChild("Points")
-			if pts and pts.Value >= C.Points then
-				for stat, on in pairs(C.Stats) do
-					if on then fire("AddPoint", stat, C.Points) end
-				end
-			end
-		end
-
-		task.wait(C.FarmLevel or C.FarmNearest and 0.12 or 0.2)
-	end
-end)
-
--- anti-afk
-LP.Idled:Connect(function()
-	if not C.AntiAfk then return end
-	pcall(function()
-		VU:CaptureController()
-		VU:Button2Down(Vector2.new(0, 0), WS.CurrentCamera.CFrame)
-		task.wait(1)
-		VU:Button2Up(Vector2.new(0, 0), WS.CurrentCamera.CFrame)
-	end)
-end)
-
---==================== low graphics ====================
-local function lowGraphics()
-	pcall(function()
-		local t = WS:FindFirstChildOfClass("Terrain")
-		if t then
-			t.WaterWaveSize = 0
-			t.WaterWaveSpeed = 0
-			t.WaterReflectance = 0
-			t.WaterTransparency = 0
-		end
-		Lighting.GlobalShadows = false
-		Lighting.FogEnd = 9e9
-		Lighting.Brightness = 1
-		pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Level01 end)
-		for _, v in pairs(WS:GetDescendants()) do
-			if v:IsA("BasePart") or v:IsA("MeshPart") or v:IsA("UnionOperation") then
-				v.Material = Enum.Material.Plastic
-				v.Reflectance = 0
-			elseif v:IsA("Decal") or v:IsA("Texture") then
-				v.Transparency = 1
-			elseif v:IsA("ParticleEmitter") or v:IsA("Trail") then
-				v.Lifetime = NumberRange.new(0)
-			elseif v:IsA("Explosion") then
-				v.BlastPressure = 1
-				v.BlastRadius = 1
-			elseif v:IsA("Fire") or v:IsA("SpotLight") or v:IsA("Smoke") or v:IsA("Sparkles") then
-				v.Enabled = false
-			end
-		end
-		for _, e in pairs(Lighting:GetChildren()) do
-			if e:IsA("BlurEffect") or e:IsA("SunRaysEffect") or e:IsA("ColorCorrectionEffect") or e:IsA("BloomEffect") or e:IsA("DepthOfFieldEffect") then
-				e.Enabled = false
-			end
-		end
-	end)
-end
-
---==================== GUI ====================
-local gui = Instance.new("ScreenGui")
-gui.Name = "MuDeltaLite"
-gui.ResetOnSpawn = false
-gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-gui.Parent = LP:WaitForChild("PlayerGui")
-
-local main = Instance.new("Frame")
-main.Size = UDim2.new(0, 252, 0, 330)
-main.Position = UDim2.new(0, 8, 0, 60)
-main.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
-main.BorderSizePixel = 0
-main.Parent = gui
-Instance.new("UICorner", main).CornerRadius = UDim.new(0, 8)
-
-local bar = Instance.new("TextButton")
-bar.Size = UDim2.new(1, 0, 0, 32)
-bar.BackgroundColor3 = Color3.fromRGB(34, 34, 42)
-bar.BorderSizePixel = 0
-bar.Text = "  Mu Delta Lite"
-bar.TextColor3 = Color3.fromRGB(240, 240, 245)
-bar.Font = Enum.Font.GothamSemibold
-bar.TextSize = 14
-bar.TextXAlignment = Enum.TextXAlignment.Left
-bar.Parent = main
-Instance.new("UICorner", bar).CornerRadius = UDim.new(0, 8)
-
-local minBtn = Instance.new("TextButton")
-minBtn.Size = UDim2.new(0, 30, 0, 22)
-minBtn.Position = UDim2.new(1, -34, 0, 5)
-minBtn.BackgroundColor3 = Color3.fromRGB(52, 52, 62)
-minBtn.BorderSizePixel = 0
-minBtn.Text = "_"
-minBtn.TextColor3 = Color3.fromRGB(235, 235, 240)
-minBtn.Font = Enum.Font.GothamBold
-minBtn.TextSize = 14
-minBtn.Parent = main
-Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 6)
-
-local scroll = Instance.new("ScrollingFrame")
-scroll.Size = UDim2.new(1, -10, 1, -42)
-scroll.Position = UDim2.new(0, 5, 0, 36)
-scroll.BackgroundTransparency = 1
-scroll.BorderSizePixel = 0
-scroll.ScrollBarThickness = 3
-scroll.ScrollBarImageColor3 = Color3.fromRGB(90, 90, 110)
-scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
-scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
-scroll.Parent = main
-
-local lay = Instance.new("UIListLayout")
-lay.Padding = UDim.new(0, 5)
-lay.SortOrder = Enum.SortOrder.LayoutOrder
-lay.Parent = scroll
-
--- drag (touch + mouse)
-do
-	local dragging, startPos, startFrame
-	bar.InputBegan:Connect(function(i)
-		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
-			dragging = true
-			startPos = i.Position
-			startFrame = main.Position
-			i.Changed:Connect(function()
-				if i.UserInputState == Enum.UserInputState.End then dragging = false end
-			end)
-		end
-	end)
-	bar.InputChanged:Connect(function(i)
-		if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
-			local d = i.Position - startPos
-			main.Position = UDim2.new(startFrame.X.Scale, startFrame.X.Offset + d.X, startFrame.Y.Scale, startFrame.Y.Offset + d.Y)
-		end
-	end)
-end
-
-local function widget(text, h, bg)
-	local b = Instance.new("TextButton")
-	b.Size = UDim2.new(1, -6, 0, h or 27)
-	b.BackgroundColor3 = bg or Color3.fromRGB(38, 38, 47)
-	b.BorderSizePixel = 0
-	b.Text = text
-	b.TextColor3 = Color3.fromRGB(232, 232, 240)
-	b.Font = Enum.Font.Gotham
-	b.TextSize = 13
-	b.AutoButtonColor = true
-	b.Parent = scroll
-	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
-	return b
-end
-
-local function header(text)
-	local l = Instance.new("TextLabel")
-	l.Size = UDim2.new(1, -6, 0, 22)
-	l.BackgroundTransparency = 1
-	l.Text = text
-	l.TextColor3 = Color3.fromRGB(140, 170, 255)
-	l.Font = Enum.Font.GothamSemibold
-	l.TextSize = 13
-	l.TextXAlignment = Enum.TextXAlignment.Left
-	l.Parent = scroll
-	return l
-end
-
-local function button(text, cb)
-	local b = widget(text)
-	b.MouseButton1Click:Connect(function() pcall(cb) end)
-	return b
-end
-
-local function toggle(text, default, cb)
-	local state = default
-	local b = widget("")
-	local function draw()
-		b.Text = text .. "   [" .. (state and "ON" or "OFF") .. "]"
-		b.TextColor3 = state and Color3.fromRGB(120, 235, 150) or Color3.fromRGB(235, 130, 130)
-	end
-	draw()
-	b.MouseButton1Click:Connect(function()
-		state = not state
-		draw()
-		pcall(cb, state)
-	end)
-	return b
-end
-
-local function cycle(text, options, idx, cb)
-	local i = idx or 1
-	local b = widget("")
-	local function draw() b.Text = text .. ":  " .. tostring(options[i]) end
-	draw()
-	b.MouseButton1Click:Connect(function()
-		i = i % #options + 1
-		draw()
-		pcall(cb, options[i])
-	end)
-	return b
-end
-
---=========== FARM ============
-header("FARM")
-toggle("Auto Farm Level", false, function(v) C.FarmLevel = v; C.FarmNearest = false end)
-toggle("Auto Farm Nearest", false, function(v) C.FarmNearest = v; C.FarmLevel = false end)
-toggle("Auto Quest", true, function(v) C.AutoQuest = v end)
-toggle("Fast Attack", true, function(v) C.FastAttack = v end)
-toggle("Auto Haki", true, function(v) C.AutoHaki = v end)
-toggle("Bring Mobs", true, function(v) C.BringMob = v end)
-
-local function backpackList()
-	local out = {}
-	for _, t in pairs(LP.Backpack:GetChildren()) do
-		if t:IsA("Tool") then table.insert(out, t.Name) end
-	end
-	if #out == 0 then out = {"(none)"} end
-	return out
-end
-
-cycle("Weapon", backpackList(), 1, function(v) C.Weapon = v end)
-button("Refresh Weapon List", function()
-	C.Weapon = nil
-end)
-
---=========== STATS ============
-header("AUTO STATS")
-toggle("Melee", false, function(v) C.Stats.Melee = v end)
-toggle("Defense", false, function(v) C.Stats.Defense = v end)
-toggle("Sword", false, function(v) C.Stats.Sword = v end)
-toggle("Gun", false, function(v) C.Stats.Gun = v end)
-toggle("Blox Fruit", false, function(v) C.Stats["Demon Fruit"] = v end)
-cycle("Points each", {1, 5, 10, 25, 50}, 1, function(v) C.Points = v end)
-
---=========== PLAYER ============
-header("PLAYER")
-toggle("Low Graphics", true, function(v)
-	C.LowGfx = v
-	if v then lowGraphics() end
-end)
-toggle("Anti AFK", true, function(v) C.AntiAfk = v end)
-
-local function setSpeed(v)
-	local h = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
-	if h then h.WalkSpeed = v end
-end
-cycle("Walk Speed", {16, 30, 50, 75, 100, 150}, 1, setSpeed)
-
-local function setJump(v)
-	local h = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
-	if h then h.UseJumpPower = true; h.JumpPower = v end
-end
-cycle("Jump Power", {50, 75, 100, 150}, 1, setJump)
-
---=========== TELEPORT ============
-local SPOTS = {
-	[1] = {
-		{"Start Island", CFrame.new(1071, 16, 1427)},
-		{"Middle Town", CFrame.new(-656, 8, 1437)},
-		{"Jungle", CFrame.new(-1250, 12, 341)},
-		{"Pirate Village", CFrame.new(-1122, 5, 3856)},
-		{"Desert", CFrame.new(1094, 6, 4193)},
-		{"Frozen Village", CFrame.new(1198, 27, -1212)},
-		{"Marine Ford", CFrame.new(-4505, 21, 4261)},
-		{"Sky Island 1", CFrame.new(-4970, 718, -2622)},
-		{"Prison", CFrame.new(4854, 6, 740)},
-		{"Magma Village", CFrame.new(-5232, 9, 8468)},
-		{"Underwater City", CFrame.new(61164, 12, 1820)},
-		{"Fountain City", CFrame.new(5133, 5, 4038)},
-	},
-	[2] = {
-		{"Kingdom of Rose", CFrame.new(-395, 119, 1246)},
-		{"Cafe", CFrame.new(-385, 73, 297)},
-		{"Green Zone", CFrame.new(-2372, 73, -3167)},
-		{"Factory", CFrame.new(430, 210, -433)},
-		{"Colosseum", CFrame.new(-1837, 45, 1360)},
-		{"Grave Island", CFrame.new(-5411, 49, -721)},
-		{"Snow Mountain", CFrame.new(512, 402, -5380)},
-		{"Cold Island", CFrame.new(-6027, 15, -5072)},
-		{"Hot Island", CFrame.new(-5478, 16, -5247)},
-		{"Cursed Ship", CFrame.new(902, 125, 33072)},
-		{"Ice Castle", CFrame.new(5400, 28, -6237)},
-		{"Forgotten Island", CFrame.new(-3043, 239, -10192)},
-	},
-	[3] = {
-		{"Port Town", CFrame.new(-610, 58, 6436)},
-		{"Hydra Island", CFrame.new(5230, 604, 345)},
-		{"Great Tree", CFrame.new(2175, 29, -6729)},
-		{"Castle on the Sea", CFrame.new(-5478, 314, -2808)},
-		{"Floating Turtle", CFrame.new(-10919, 332, -8638)},
-		{"Mansion", CFrame.new(-12554, 332, -7622)},
-		{"Haunted Castle", CFrame.new(-9512, 142, 5549)},
-		{"Peanut Island", CFrame.new(-2063, 38, -10288)},
-		{"Ice Cream Island", CFrame.new(-840, 66, -10877)},
-		{"Cake Land", CFrame.new(-2072, 70, -12097)},
-	},
-}
-
-header("TELEPORT - SEA " .. SEA)
-for _, s in ipairs(SPOTS[SEA] or {}) do
-	button(s[1], function() hardTp(s[2]) end)
-end
-
-header("WORLD")
-button("Go to First Sea", function() fire("TravelMain") end)
-button("Go to Second Sea", function() fire("TravelDressrosa") end)
-button("Go to Third Sea", function() fire("TravelZou") end)
-
-header("MISC")
-button("Rejoin Server", function()
-	game:GetService("TeleportService"):Teleport(game.PlaceId, LP)
-end)
-button("Unload Script", function()
-	getgenv().MuDeltaLite = false
-	gui:Destroy()
-end)
-
--- minimize
-local open = true
-minBtn.MouseButton1Click:Connect(function()
-	open = not open
-	scroll.Visible = open
-	main.Size = open and UDim2.new(0, 252, 0, 330) or UDim2.new(0, 252, 0, 32)
-end)
-
---==================== boot ====================
-indexQuests()
-indexNpcs()
-if C.LowGfx then lowGraphics() end
-
-task.spawn(function()
-	while true do
-		task.wait(1)
-		if C.LowGfx and Lighting.FogEnd ~= 9e9 then
-			Lighting.FogEnd = 9e9
-			Lighting.GlobalShadows = false
-		end
-	end
-end)
-
-pcall(function()
-	StarterGui:SetCore("SendNotification", {
-		Title = "Mu Delta Lite",
-		Text = "Loaded. Tap a toggle to start.",
-		Duration = 5,
-	})
-end)
+			local c = LP.
